@@ -1,0 +1,1422 @@
+
+
+--- FILE: config/settings.py ---
+"""Typed configuration loader.
+
+Reads YAML config and exposes it as nested dataclasses with attribute access.
+Falls back to default.yaml shipped with the package when no path is given.
+"""
+
+from __future__ import annotations
+
+import copy
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+_DEFAULT_CONFIG_PATH = Path(__file__).parent / "default.yaml"
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge *override* into *base*, returning a new dict."""
+    merged = copy.deepcopy(base)
+    for key, value in override.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+class _Namespace:
+    """Dict-like object with attribute access for nested config sections.
+
+    Dicts whose keys are all strings become nested _Namespaces.
+    Dicts with non-string keys (e.g. YAML integer keys like class_map)
+    are stored as plain dicts to avoid setattr errors.
+    """
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        for key, value in data.items():
+            str_key = str(key)
+            if isinstance(value, dict) and all(isinstance(k, str) for k in value):
+                setattr(self, str_key, _Namespace(value))
+            else:
+                setattr(self, str_key, value)
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in self.__dict__.items():
+            if isinstance(value, _Namespace):
+                result[key] = value.to_dict()
+            else:
+                result[key] = value
+        return result
+
+    def __repr__(self) -> str:
+        items = ", ".join(f"{k}={v!r}" for k, v in self.__dict__.items())
+        return f"Namespace({items})"
+
+
+@dataclass
+class Config:
+    """Top-level configuration container.
+
+    Sections are accessible as attributes:
+        cfg.vision.confidence_threshold
+        cfg.fc26.green_timing_delay_ms
+    """
+
+    capture: _Namespace = field(default_factory=lambda: _Namespace({}))
+    vision: _Namespace = field(default_factory=lambda: _Namespace({}))
+    tracker: _Namespace = field(default_factory=lambda: _Namespace({}))
+    world: _Namespace = field(default_factory=lambda: _Namespace({}))
+    state: _Namespace = field(default_factory=lambda: _Namespace({}))
+    decision: _Namespace = field(default_factory=lambda: _Namespace({}))
+    actions: _Namespace = field(default_factory=lambda: _Namespace({}))
+    fc26: _Namespace = field(default_factory=lambda: _Namespace({}))
+    tactics: _Namespace = field(default_factory=lambda: _Namespace({}))
+    observe: _Namespace = field(default_factory=lambda: _Namespace({}))
+    performance: _Namespace = field(default_factory=lambda: _Namespace({}))
+
+    _raw: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        return self._raw
+
+
+def load_config(path: str | Path | None = None, overrides: dict[str, Any] | None = None) -> Config:
+    """Load configuration from YAML files.
+
+    1. Always loads the built-in default.yaml first.
+    2. If *path* is given, deep-merges the user file on top.
+    3. If *overrides* dict is given, deep-merges that last.
+    """
+    with open(_DEFAULT_CONFIG_PATH, "r") as f:
+        base: dict[str, Any] = yaml.safe_load(f)
+
+    if path is not None:
+        with open(path, "r") as f:
+            user: dict[str, Any] = yaml.safe_load(f) or {}
+        base = _deep_merge(base, user)
+
+    if overrides:
+        base = _deep_merge(base, overrides)
+
+    cfg = Config(_raw=base)
+    for section_name, section_data in base.items():
+        if isinstance(section_data, dict):
+            setattr(cfg, section_name, _Namespace(section_data))
+
+
+    return cfg
+
+--- FILE: state/match_state.py ---
+"""Match state representation.
+
+MatchState is the central data structure that the decision engine consumes.
+It is rebuilt every frame by the StateEstimator from tracked objects.
+"""
+
+from __future__ import annotations
+
+import enum
+from dataclasses import dataclass, field
+
+from vision.geometry import Vec2
+from vision.types import TrackedObject
+
+
+class Zone(enum.Enum):
+    DEFENSIVE_THIRD = "defensive_third"
+    MIDDLE_THIRD = "middle_third"
+    ATTACKING_THIRD = "attacking_third"
+    BOX = "box"
+
+
+class PossessionState(enum.Enum):
+    OWN_TEAM = "own_team"
+    OPPONENT = "opponent"
+    LOOSE = "loose"
+    CONTESTED = "contested"
+
+
+@dataclass(slots=True)
+class PassingLane:
+    """A corridor between the controlled player and a teammate."""
+
+    target: TrackedObject
+    direction: Vec2
+    distance: float
+    is_clear: bool
+    obstruction_count: int
+    risk_score: float  # 0 = safe, 1 = very risky
+
+
+@dataclass(slots=True)
+class ShotLane:
+    """Line from controlled player to a goalmouth target point."""
+
+    target_point: Vec2  # point on the goal line
+    direction: Vec2
+    distance: float
+    is_clear: bool
+    angle_deg: float  # angle relative to goal center
+    quality: float  # 0 = bad, 1 = excellent
+
+
+@dataclass(slots=True)
+class MatchState:
+    """Complete snapshot of the match situation for one frame.
+
+    Built by StateEstimator. Consumed by DecisionEngine.
+    """
+
+    frame_id: int
+    timestamp_ms: float
+
+    # --- Ball ---
+    ball: TrackedObject | None = None
+    ball_velocity: Vec2 = field(default_factory=Vec2.zero)
+    ball_speed: float = 0.0
+
+    # --- Controlled player ---
+    controlled_player: TrackedObject | None = None
+    is_charging_shot: bool = False
+
+    # --- Players ---
+    teammates: list[TrackedObject] = field(default_factory=list)
+    opponents: list[TrackedObject] = field(default_factory=list)
+    goalkeepers_team: list[TrackedObject] = field(default_factory=list)
+    goalkeepers_opponent: list[TrackedObject] = field(default_factory=list)
+    referees: list[TrackedObject] = field(default_factory=list)
+
+    # --- Spatial analysis ---
+    ball_zone: Zone = Zone.MIDDLE_THIRD
+    controlled_zone: Zone = Zone.MIDDLE_THIRD
+    possession: PossessionState = PossessionState.LOOSE
+    distance_to_ball: float = float("inf")
+
+    # --- Pressure & space ---
+    local_pressure: float = 0.0  # 0 = no pressure, 1 = surrounded
+    nearest_opponent_dist: float = float("inf")
+    nearest_teammate_dist: float = float("inf")
+    dribble_space: float = 0.0  # pixels of free space ahead
+    open_space_around: float = 0.0  # average distance to nearby opponents
+
+    # --- Lanes ---
+    passing_lanes: list[PassingLane] = field(default_factory=list)
+    shot_lanes: list[ShotLane] = field(default_factory=list)
+    best_passing_lane: PassingLane | None = None
+    best_shot_lane: ShotLane | None = None
+
+    # --- Tactical indicators ---
+    defensive_danger: float = 0.0  # 0 = safe, 1 = extreme danger
+    counterattack_opportunity: float = 0.0
+    shot_opportunity: float = 0.0
+
+    # --- Predictions ---
+    predicted_ball_pos: Vec2 = field(default_factory=Vec2.zero)
+    predicted_controlled_pos: Vec2 = field(default_factory=Vec2.zero)
+
+    # --- History ---
+    previous: MatchState | None = field(default=None, repr=False)
+
+    def get_all_opponents_positions(self) -> list[Vec2]:
+        return [o.position for o in self.opponents]
+
+    def get_all_teammates_positions(self) -> list[Vec2]:
+        return [t.position for t in self.teammates]
+
+    @property
+    def nearest_opponent_dist_to_gk(self) -> float:
+        """Расстояние от ближайшего оппонента до нашего вратаря."""
+        if not self.goalkeepers_team or not self.opponents:
+            return 999.0
+        gk_pos = self.goalkeepers_team[0].position
+        return min(p.position.distance_to(gk_pos) for p in self.opponents)
+
+--- FILE: state/estimator.py ---
+"""State estimation pipeline.
+
+Transforms tracked objects into a MatchState by computing spatial
+relationships, lane analysis, pressure metrics, and possession.
+"""
+
+from __future__ import annotations
+
+import time
+import math
+from collections import deque
+
+from config.settings import Config
+from state.match_state import (
+    MatchState,
+    PassingLane,
+    PossessionState,
+    ShotLane,
+    Zone,
+)
+from state.prediction import predict_state
+from vision.geometry import Vec2
+from vision.types import ObjectClass, TrackedObject
+
+
+class StateEstimator:
+    """Builds MatchState from a list of TrackedObjects each frame.
+
+    Maintains a short history buffer for temporal analysis.
+    """
+
+    def __init__(self, cfg: Config) -> None:
+        self._cfg = cfg
+
+        # Safe access to state config
+        state_cfg = getattr(cfg, 'state', None)
+        self._history: deque[MatchState] = deque(maxlen=getattr(state_cfg, 'history_length', 15))
+        self._frame_count: int = 0
+
+        # Cache config values with defaults
+        self._possession_dist = getattr(state_cfg, 'possession_distance_threshold', 45.0)
+        self._pressure_radius = getattr(state_cfg, 'pressure_radius', 120.0)
+        self._pass_lane_w = getattr(state_cfg, 'passing_lane_width', 30.0)
+        self._shot_lane_w = getattr(state_cfg, 'shot_lane_width', 25.0)
+        self._open_space_r = getattr(state_cfg, 'open_space_radius', 80.0)
+
+        zb = getattr(state_cfg, 'zone_boundaries', None)
+        self._zone_def = getattr(zb, 'defensive_third', 0.33)
+        self._zone_mid = getattr(zb, 'middle_third', 0.66)
+
+        world_cfg = getattr(cfg, 'world', None)
+        self._screen_w = float(getattr(world_cfg, 'screen_width', 1920))
+        self._screen_h = float(getattr(world_cfg, 'screen_height', 1080))
+        self._crop_top = float(getattr(world_cfg, 'crop_top', 0.0))
+        self._crop_bottom = float(getattr(world_cfg, 'crop_bottom', 0.0))
+        self._crop_left = float(getattr(world_cfg, 'crop_left', 0.0))
+        self._crop_right = float(getattr(world_cfg, 'crop_right', 0.0))
+
+        self._pred_horizon = getattr(state_cfg, 'prediction_horizon_sec', 0.5)
+
+    def estimate(self, tracked: list[TrackedObject], frame_id: int , fps: float = 30.0) -> MatchState:
+        """Build a complete MatchState from current tracked objects."""
+        ts = time.monotonic() * 1000
+        self._frame_count += 1
+
+        # --- Classify objects ---
+        ball: TrackedObject | None = None
+        teammates: list[TrackedObject] = []
+        opponents: list[TrackedObject] = []
+        gk_team: list[TrackedObject] = []
+        gk_opp: list[TrackedObject] = []
+        refs: list[TrackedObject] = []
+
+        for obj in tracked:
+            match obj.obj_class:
+                case ObjectClass.BALL:
+                    if ball is None or obj.confidence > ball.confidence:
+                        ball = obj
+                case ObjectClass.PLAYER_TEAM:
+                    teammates.append(obj)
+                case ObjectClass.PLAYER_OPPONENT:
+                    opponents.append(obj)
+                case ObjectClass.GOALKEEPER_TEAM:
+                    gk_team.append(obj)
+                case ObjectClass.GOALKEEPER_OPPONENT:
+                    gk_opp.append(obj)
+                case ObjectClass.REFEREE:
+                    refs.append(obj)
+                case _:
+                    pass
+
+        # Controlled player heuristic
+        controlled = self._pick_controlled_player(teammates, ball)
+
+        state = MatchState(
+            frame_id=frame_id,
+            timestamp_ms=ts,
+            ball=ball,
+            controlled_player=controlled,
+            teammates=teammates,
+            opponents=opponents,
+            goalkeepers_team=gk_team,
+            goalkeepers_opponent=gk_opp,
+            referees=refs,
+        )
+
+        if ball is not None:
+            state.ball_velocity = ball.velocity
+            state.ball_speed = ball.speed
+
+        # --- Zones ---
+        if ball is not None:
+            state.ball_zone = self._classify_zone(ball.position)
+        if controlled is not None:
+            state.controlled_zone = self._classify_zone(controlled.position)
+
+        # --- Distance to ball ---
+        if controlled is not None and ball is not None:
+            state.distance_to_ball = controlled.position.distance_to(ball.position)
+
+        # --- Possession ---
+        state.possession = self._estimate_possession(ball, teammates, opponents)
+
+        # --- Pressure & space ---
+        if controlled is not None:
+            opp_positions = [o.position for o in opponents]
+            state.local_pressure = self._compute_pressure(controlled.position, opp_positions)
+            state.nearest_opponent_dist = self._nearest_dist(controlled.position, opp_positions)
+            tm_positions = [t.position for t in teammates if t.track_id != controlled.track_id]
+            state.nearest_teammate_dist = self._nearest_dist(controlled.position, tm_positions)
+            state.dribble_space = self._compute_dribble_space(controlled, opp_positions)
+            state.open_space_around = self._compute_open_space(controlled.position, opp_positions)
+
+        # --- Lanes ---
+        if controlled is not None:
+            opp_pos = [o.position for o in opponents]
+            state.passing_lanes = self._analyze_passing_lanes(controlled, teammates, opp_pos)
+            state.shot_lanes = self._analyze_shot_lanes(controlled, opp_pos)
+            if state.passing_lanes:
+                state.best_passing_lane = min(state.passing_lanes, key=lambda l: l.risk_score)
+            if state.shot_lanes:
+                state.best_shot_lane = max(state.shot_lanes, key=lambda l: l.quality)
+
+        # --- Tactical indicators ---
+        state.defensive_danger = self._compute_defensive_danger(state)
+        state.counterattack_opportunity = self._compute_counter_opportunity(state)
+        state.shot_opportunity = self._compute_shot_opportunity(state)
+
+        # --- Predictions ---
+        state.predicted_ball_pos, state.predicted_controlled_pos = predict_state(
+            state, self._pred_horizon, fps=fps
+        )
+
+        # --- Link history ---
+        if self._history:
+            state.previous = self._history[-1]
+        self._history.append(state)
+
+        return state
+
+    # --- Private helpers ---
+
+    @staticmethod
+    def _pick_controlled_player(
+            teammates: list[TrackedObject], ball: TrackedObject | None
+    ) -> TrackedObject | None:
+        if not teammates:
+            return None
+
+        # Если мяч далеко или его нет, выбираем просто самого заметного
+        if ball is None:
+            return max(teammates, key=lambda t: t.confidence)
+
+        ball_pos = ball.position
+
+        # Находим ближайшего к мячу
+        nearest = min(teammates, key=lambda t: t.position.distance_to(ball_pos))
+
+        # ВАЖНО: Если расстояние до мяча > 200 пикселей,
+        # значит мы ВООБЩЕ не контролируем ситуацию.
+        # Возвращаем ближайшего, но даем сигнал Scorer-у на переключение.
+        return nearest
+
+    def _classify_zone(self, pos: Vec2) -> Zone:
+        nx = self._normalize_x(pos.x, self._screen_w, self._crop_left, self._crop_right)
+        if nx < self._zone_def:
+            return Zone.DEFENSIVE_THIRD
+        if nx < self._zone_mid:
+            return Zone.MIDDLE_THIRD
+        return Zone.ATTACKING_THIRD
+
+    @staticmethod
+    def _normalize_x(x: float, screen_w: float, crop_left: float, crop_right: float) -> float:
+        eff_w = screen_w - crop_left - crop_right
+        if eff_w < 1:
+            return 0.5
+        return max(0.0, min(1.0, (x - crop_left) / eff_w))
+
+    def _estimate_possession(
+            self,
+            ball: TrackedObject | None,
+            teammates: list[TrackedObject],
+            opponents: list[TrackedObject],
+    ) -> PossessionState:
+        if ball is None:
+            return PossessionState.LOOSE
+        bp = ball.position
+        team_near = any(t.position.distance_to(bp) < self._possession_dist for t in teammates)
+        opp_near = any(o.position.distance_to(bp) < self._possession_dist for o in opponents)
+        if team_near and opp_near:
+            return PossessionState.CONTESTED
+        if team_near:
+            return PossessionState.OWN_TEAM
+        if opp_near:
+            return PossessionState.OPPONENT
+        return PossessionState.LOOSE
+
+    def _compute_pressure(self, pos: Vec2, opponents: list[Vec2]) -> float:
+        count = sum(1 for o in opponents if pos.distance_to(o) < self._pressure_radius)
+        return min(1.0, count / 4.0)
+
+    @staticmethod
+    def _nearest_dist(pos: Vec2, others: list[Vec2]) -> float:
+        if not others:
+            return float("inf")
+        return min(pos.distance_to(o) for o in others)
+
+    @staticmethod
+    def _compute_dribble_space(player: TrackedObject, opponents: list[Vec2]) -> float:
+        """Approximate free space in the player's movement direction."""
+        if player is None:
+            return 0.0
+        direction = player.velocity.normalized()
+        if direction.length() < 0.1:
+            direction = Vec2(1.0, 0.0)
+        check_dist = 200.0
+        for d in range(10, int(check_dist), 10):
+            probe = player.position + direction * d
+            for opp in opponents:
+                if probe.distance_to(opp) < 40:
+                    return float(d)
+        return check_dist
+
+
+    def _compute_open_space(self, pos: Vec2, opponents: list[Vec2]) -> float:
+        nearby = [pos.distance_to(o) for o in opponents if pos.distance_to(o) < self._open_space_r]
+        if not nearby:
+            return self._open_space_r
+        return sum(nearby) / len(nearby)
+
+    def _analyze_passing_lanes(
+            self,
+            controlled: TrackedObject,
+            teammates: list[TrackedObject],
+            opp_positions: list[Vec2],
+    ) -> list[PassingLane]:
+        lanes: list[PassingLane] = []
+        from vision.geometry import is_lane_clear
+        for tm in teammates:
+            if tm.track_id == controlled.track_id:
+                continue
+            direction = (tm.position - controlled.position).normalized()
+            dist = controlled.position.distance_to(tm.position)
+            if dist < 20:
+                continue
+            clear = is_lane_clear(
+                controlled.position, tm.position, opp_positions, self._pass_lane_w
+            )
+            risk = 0.0 if clear else 0.5
+            risk += min(0.3, dist / 1000.0)
+            risk += self._compute_pressure(tm.position, opp_positions) * 0.2
+            lanes.append(PassingLane(
+                target=tm,
+                direction=direction,
+                distance=dist,
+                is_clear=clear,
+                obstruction_count=0 if clear else 1,
+                risk_score=min(1.0, risk),
+            ))
+        return lanes
+
+    def _analyze_shot_lanes(
+            self, controlled: TrackedObject, opp_positions: list[Vec2]
+    ) -> list[ShotLane]:
+        goal_x = self._screen_w - self._crop_right
+        goal_center_y = self._screen_h / 2
+        goal_half_height = 80.0
+        lanes: list[ShotLane] = []
+        from vision.geometry import is_lane_clear
+
+        for offset in (-goal_half_height, -goal_half_height / 2, 0,
+                       goal_half_height / 2, goal_half_height):
+            target = Vec2(goal_x, goal_center_y + offset)
+            direction = (target - controlled.position).normalized()
+            dist = controlled.position.distance_to(target)
+            clear = is_lane_clear(
+                controlled.position, target, opp_positions, self._shot_lane_w
+            )
+            center_dir = Vec2(goal_x - controlled.position.x,
+                              goal_center_y - controlled.position.y).normalized()
+            dot = center_dir.dot(direction)
+            angle = math.degrees(math.acos(max(-1.0, min(1.0, dot))))
+
+            quality = 0.4 if clear else 0.0
+            quality += max(0.0, 1.0 - dist / 800.0) * 0.3
+            quality += max(0.0, 1.0 - angle / 45.0) * 0.3
+
+            lanes.append(ShotLane(
+                target_point=target,
+                direction=direction,
+                distance=dist,
+                is_clear=clear,
+                angle_deg=angle,
+                quality=max(0.0, min(1.0, quality)),
+            ))
+        return lanes
+
+    @staticmethod
+    def _compute_defensive_danger(state: MatchState) -> float:
+        danger = 0.0
+        if state.ball_zone == Zone.DEFENSIVE_THIRD:
+            danger += 0.3
+        if state.possession == PossessionState.OPPONENT:
+            danger += 0.3
+        if state.ball is not None:
+            if state.ball_velocity.x < -2:
+                danger += 0.2
+        danger += state.local_pressure * 0.2
+        return min(1.0, danger)
+
+
+    @staticmethod
+    def _compute_counter_opportunity(state: MatchState) -> float:
+        opp = 0.0
+        if state.possession == PossessionState.OWN_TEAM:
+            opp += 0.2
+        if state.controlled_zone == Zone.MIDDLE_THIRD:
+            opp += 0.2
+        if state.dribble_space > 150:
+            opp += 0.3
+
+        controlled_player = state.controlled_player
+        if controlled_player is not None:
+            ahead_opps = sum(
+                1 for o in state.opponents
+                if o.position.x > controlled_player.position.x
+            )
+            if ahead_opps <= 2:
+                opp += 0.3
+
+        return min(1.0, opp)
+
+    @staticmethod
+    def _compute_shot_opportunity(state: MatchState) -> float:
+        if state.best_shot_lane is None:
+            return 0.0
+        return state.best_shot_lane.quality
+
+
+--- FILE: decision/scorer.py ---
+"""Heuristic action scorer."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+from typing import Tuple, Any, Optional
+
+from config.settings import Config
+from decision.actions import ActionSpec, ActionType, check_precondition
+from state.match_state import MatchState, PossessionState, Zone
+
+if TYPE_CHECKING:
+    pass
+
+
+class ActionScorer:
+    """Produces scored ActionSpecs for all legal actions given a MatchState."""
+
+    def __init__(self, cfg: Config) -> None:
+        # Safe access to decision weights
+        decision_cfg = getattr(cfg, 'decision', None)
+        w = getattr(decision_cfg, 'weights', None)
+        
+        self._w_goal = getattr(w, 'goal_threat', 1.5)
+        self._w_safety = getattr(w, 'safety', 1.2)
+        self._w_support = getattr(w, 'support', 0.8)
+        self._w_turnover = getattr(w, 'turnover_risk', -1.0)
+        self._w_opp_prox = getattr(w, 'opponent_proximity', -0.6)
+        self._w_angle = getattr(w, 'angle_to_goal', 1.0)
+        self._w_def_shape = getattr(w, 'defensive_shape', 0.7)
+
+        # Safe access to actions config
+        actions_cfg = getattr(cfg, 'actions', None)
+        self._cooldowns_cfg: dict[str, int] = {}
+        self._durations_cfg: dict[str, int] = {}
+        
+        cd = getattr(actions_cfg, "cooldowns", {})
+        self._cooldowns_cfg = cd.to_dict() if hasattr(cd, "to_dict") else (cd if isinstance(cd, dict) else {})
+        
+        dur = getattr(actions_cfg, "durations", {})
+        self._durations_cfg = dur.to_dict() if hasattr(dur, "to_dict") else (dur if isinstance(dur, dict) else {})
+
+        # Active cooldown timers
+        self._cooldown_timers: dict[str, int] = {}
+
+    def score_all(self, state: MatchState) -> list[ActionSpec]:
+        """Score every legal action and return sorted list (the best first)."""
+        self._tick_cooldowns()
+
+        candidates: list[ActionSpec] = []
+        for action_type in ActionType:
+            if not check_precondition(action_type, state):
+                continue
+            if self._is_on_cooldown(action_type):
+                continue
+
+            spec = self._score_action(action_type, state)
+            if spec is not None:
+                candidates.append(spec)
+
+        candidates.sort(key=lambda s: s.score, reverse=True)
+        return candidates
+
+    def apply_cooldown(self, action_type: ActionType) -> None:
+        """Start cooldown timer after an action is executed."""
+        cd = self._cooldowns_cfg.get(action_type.value, 0)
+        if cd > 0:
+            self._cooldown_timers[action_type.value] = cd
+
+    def _tick_cooldowns(self) -> None:
+        expired = []
+        for name, remaining in self._cooldown_timers.items():
+            self._cooldown_timers[name] = remaining - 1
+            if self._cooldown_timers[name] <= 0:
+                expired.append(name)
+        for name in expired:
+            del self._cooldown_timers[name]
+
+    def _is_on_cooldown(self, action_type: ActionType) -> bool:
+        return self._cooldown_timers.get(action_type.value, 0) > 0
+
+    def _get_duration(self, action_type: ActionType) -> int:
+        return self._durations_cfg.get(action_type.value, 4)
+
+    def _score_action(self, action_type: ActionType, state: MatchState) -> ActionSpec | None:
+        """Compute composite score for a single action type."""
+
+        # 1. Сбор результатов
+        match action_type:
+            case ActionType.MOVE | ActionType.R1_DRIBBLE:
+                res = self._score_move(state, action_type)
+            case ActionType.SPRINT | ActionType.EXPLOSIVE_BURST:
+                res = self._score_sprint(state, action_type)
+            case ActionType.PASS | ActionType.PRECISION_PASS:
+                res = self._score_pass(state, action_type)
+            case ActionType.THROUGH_BALL:
+                res = self._score_through_ball(state)
+            case ActionType.SHOOT | ActionType.LOW_DRIVEN_SHOT | ActionType.FINESSE_SHOT | ActionType.TRIVELA_SHOT:
+                res = self._score_shoot(state, action_type)
+            case ActionType.JOCKEY | ActionType.SPEED_JOCKEY:
+                s, r, e, m = self._score_jockey(state)
+                res = (s, r, e, None, m)
+            case ActionType.STAND_TACKLE | ActionType.CLEAR | ActionType.CONTAIN:
+                # Группируем похожие вызовы для чистоты
+                if action_type == ActionType.STAND_TACKLE:
+                    s, r, e, m = self._score_tackle(state)
+                elif action_type == ActionType.CLEAR:
+                    s, r, e, m = self._score_clear(state)
+                else:
+                    s, r, e, m = self._score_contain(state)
+                res = (s, r, e, None, m)
+            case ActionType.SWITCH_PLAYER | ActionType.RS_SWITCH:
+                s, r, e, m = self._score_switch(state)
+                res = (s, r, e, None, m)
+            case ActionType.L2_SHIELD:
+                s, r, e, m = self._score_shield(state)
+                res = (s, r, e, None, m)
+            case ActionType.CANCEL | ActionType.SUPER_CANCEL:
+                res = (0.05, 0.0, 0.0, None, {})
+            case ActionType.GK_NUDGE:
+                res = (0.02, 0.0, 0.0, None, {})
+            case ActionType.GK_RUSH:
+                s, r, e, m = self._score_gk_rush(state)
+                res = (s, r, e, None, m)
+            #case _:
+                #res = (0.0, 0.0, 0.0, None, {})
+
+        # 2. Распаковка с принудительным указанием типов для PyCharm
+        score, risk, ev, raw_direction, metadata = res
+
+        # 3. Обработка направления с явным кастом типа
+        direction_tuple: Optional[Tuple[float, float]] = None
+
+        if raw_direction is not None:
+            # Если это объект Vec2 (имеет метод as_tuple)
+            if hasattr(raw_direction, "as_tuple"):
+                d_tuple = raw_direction.as_tuple()
+                if isinstance(d_tuple, tuple) and len(d_tuple) >= 2:
+                    direction_tuple = (float(d_tuple[0]), float(d_tuple[1]))
+            # Если это уже кортеж
+            elif isinstance(raw_direction, tuple) and len(raw_direction) >= 2:
+                direction_tuple = (float(raw_direction[0]), float(raw_direction[1]))
+
+        # 4. Создаем спецификацию
+        return ActionSpec(
+            action_type=action_type,
+            score=float(score),
+            risk=float(risk),
+            expected_value=float(ev),
+            direction=direction_tuple,  # Теперь PyCharm видит Optional[Tuple[float, float]]
+            target_position=None,
+            duration_frames=self._get_duration(action_type),
+            interruptible=action_type not in (
+                ActionType.SHOOT, ActionType.LOW_DRIVEN_SHOT, ActionType.STAND_TACKLE,
+            ),
+            metadata=metadata,
+        )
+
+    # --- Individual scoring functions ---
+
+
+    @staticmethod
+    def _score_move(state: MatchState, action_type: ActionType) -> Tuple[float, float, float, Any, dict[str, float]]:
+        if state.controlled_player is None:
+            return 0.0, 0.0, 0.0, None, {}
+
+        score = 0.3
+        # risk = 0.1
+        metadata: dict[str, float] = {}
+
+        if state.possession != PossessionState.OWN_TEAM and state.ball is not None:
+            # Вектор К МЯЧУ
+            direction = state.ball.position - state.controlled_player.position
+
+            # НО: Если мы УЖЕ очень близко к мячу, не нужно в него врезаться,
+            # нужно начинать разворот к воротам
+            if state.distance_to_ball < 30:
+                from vision.geometry import Vec2
+                direction = Vec2(1.0, 0.0)  # Смотрим на ворота врага
+        else:
+            score += state.dribble_space / 200.0 * 0.2
+            direction = state.controlled_player.velocity
+            if direction.length() < 0.1:
+                from vision.geometry import Vec2
+                direction = Vec2(1.0, 0.0)
+
+        if action_type == ActionType.R1_DRIBBLE:
+            if state.nearest_opponent_dist < 100:
+                score += 0.15
+                metadata["close_control_bonus"] = 0.15
+
+        risk = state.local_pressure * 0.3
+        ev = score - risk
+        metadata["pressure_risk"] = state.local_pressure * 0.3
+
+        return score, risk, ev, direction, metadata
+
+    @staticmethod
+    def _score_sprint(state: MatchState, action_type: ActionType) -> tuple:
+        if state.controlled_player is None:
+            return 0.0, 0.0, 0.0, None, {}
+
+        score = 0.2
+        # risk = 0.15
+        metadata: dict[str, float] = {}
+
+        space_bonus = min(0.4, state.dribble_space / 200.0 * 0.4)
+        score += space_bonus
+        metadata["space_bonus"] = space_bonus
+
+        if state.nearest_opponent_dist > 150:
+            score += 0.2
+            metadata["clear_ahead"] = 0.2
+
+        if action_type == ActionType.EXPLOSIVE_BURST and state.counterattack_opportunity > 0.5:
+            score += 0.25
+            metadata["burst_counter_bonus"] = 0.25
+
+        risk = state.local_pressure * 0.4
+        if state.dribble_space < 50:
+            risk += 0.3
+
+        direction = state.controlled_player.velocity
+        if direction.length() < 0.1:
+            from vision.geometry import Vec2
+            direction = Vec2(1.0, 0.0)
+
+        ev = score - risk
+        return score, risk, ev, direction, metadata
+
+    def _score_pass(self, state: MatchState, action_type: ActionType) -> tuple:
+        lane = state.best_passing_lane
+        if lane is None:
+            return 0.1, 0.3, -0.2, None, {}
+
+        score = 0.4
+        risk = lane.risk_score
+        metadata: dict[str, float] = {}
+
+        if lane.is_clear:
+            score += 0.3 * self._w_safety
+            metadata["clear_lane"] = 0.3 * self._w_safety
+
+        dist_factor = max(0.0, 1.0 - lane.distance / 600.0)
+        score += dist_factor * 0.2 * self._w_support
+        metadata["distance_factor"] = dist_factor * 0.2
+
+        if state.local_pressure > 0.5:
+            score += 0.2
+            metadata["pressure_escape"] = 0.2
+
+        if action_type == ActionType.PRECISION_PASS:
+            score += 0.1
+            metadata["precision_bonus"] = 0.1
+
+        ev = score - risk * abs(self._w_turnover)
+        target = lane.target.position
+        return score, risk, ev, target, metadata
+
+    def _score_through_ball(self, state: MatchState) -> tuple:
+        lane = state.best_passing_lane
+        if lane is None or not lane.is_clear:
+            return 0.1, 0.5, -0.4, None, {}
+
+        score = 0.5
+        risk = 0.4
+        metadata: dict[str, float] = {}
+
+        if state.controlled_zone == Zone.ATTACKING_THIRD:
+            score += 0.2 * self._w_goal
+            metadata["final_third_bonus"] = 0.2 * self._w_goal
+
+        if state.counterattack_opportunity > 0.5:
+            score += 0.2
+            metadata["counter_bonus"] = 0.2
+
+        ev = score - risk * abs(self._w_turnover)
+        target = lane.target.position
+        return score, risk, ev, target, metadata
+
+    def _score_shoot(self, state: MatchState, action_type: ActionType) -> tuple:
+        lane = state.best_shot_lane
+
+        if lane is None or lane.distance > 280:
+            return 0.0, 1.0, -1.0, None, {}
+
+        score = lane.quality * self._w_goal
+        risk = 0.3
+        metadata: dict[str, float] = {}
+
+        if not lane.is_clear:
+            risk += 0.3
+            metadata["blocked_lane"] = 0.3
+
+        dist_penalty = min(0.3, lane.distance / 800.0 * 0.3)
+        score -= dist_penalty
+        metadata["dist_penalty"] = dist_penalty
+
+        if action_type == ActionType.LOW_DRIVEN_SHOT and lane.distance < 250:
+            score += 0.25
+            metadata["low_driven_box_bonus"] = 0.25
+        elif action_type == ActionType.FINESSE_SHOT:
+            if 25 <= lane.angle_deg <= 55:
+                score += 0.2
+                metadata["finesse_angle_bonus"] = 0.2
+        elif action_type == ActionType.TRIVELA_SHOT:
+            if 30 <= lane.angle_deg <= 70:
+                score += 0.15
+                metadata["trivela_angle_bonus"] = 0.15
+
+        ev = score * 0.7 - risk * 0.3
+        target = lane.target_point
+        return score, risk, ev, target, metadata
+
+    def _score_jockey(self, state: MatchState) -> tuple[float, float, float, dict[str, float]]:
+        score = 0.0
+        metadata: dict[str, float] = {}
+
+        if state.possession in (PossessionState.OPPONENT, PossessionState.CONTESTED):
+            score += 0.4
+            metadata["defensive_posture"] = 0.4
+        if state.defensive_danger > 0.3:
+            score += state.defensive_danger * 0.3 * self._w_def_shape
+            metadata["danger_response"] = state.defensive_danger * 0.3
+
+        risk = 0.1
+        ev = score - risk
+        return score, risk, ev, metadata
+
+    @staticmethod
+    def _score_tackle(state: MatchState) -> tuple[float, float, float, dict[str, float]]:
+        score = 0.0
+        risk = 0.4
+        metadata: dict[str, float] = {}
+
+        if state.distance_to_ball < 100:  # Было 50
+            score += 0.7  # Было 0.5
+            metadata["ball_proximity"] = 0.5
+        if state.defensive_danger > 0.6:
+            score += 0.2
+            metadata["emergency_tackle"] = 0.2
+
+        risk += (1.0 - min(1.0, state.distance_to_ball / 100.0)) * 0.2
+        ev = score - risk
+        return score, risk, ev, metadata
+
+    @staticmethod
+    def _score_clear(state: MatchState) -> tuple[float, float, float, dict[str, float]]:
+        score = 0.0
+        metadata: dict[str, float] = {}
+
+        if state.defensive_danger > 0.6:
+            score += 0.6
+            metadata["high_danger_clear"] = 0.6
+        if state.ball_zone == Zone.DEFENSIVE_THIRD:
+            score += 0.2
+            metadata["defensive_zone"] = 0.2
+
+        risk = 0.2
+        ev = score - risk
+        return score, risk, ev, metadata
+
+    @staticmethod
+    def _score_contain(state: MatchState) -> tuple[float, float, float, dict[str, float]]:
+        score = 0.0
+        metadata: dict[str, float] = {}
+
+        if state.possession == PossessionState.OPPONENT:
+            score += 0.35
+            metadata["contain_defense"] = 0.35
+        score += state.defensive_danger * 0.2
+        metadata["danger_factor"] = state.defensive_danger * 0.2
+
+        risk = 0.05
+        ev = score - risk
+        return score, risk, ev, metadata
+
+    @staticmethod
+    def _score_switch(state: MatchState) -> tuple[float, float, float, dict[str, float]]:
+        score = 0.05
+        metadata: dict[str, float] = {}
+
+        if state.possession != PossessionState.OWN_TEAM:
+            if state.ball is not None and state.controlled_player is not None:
+                ctrl_dist = state.distance_to_ball
+                for tm in state.teammates:
+                    tm_dist = tm.position.distance_to(state.ball.position)
+                    # Если напарник в 2 раза ближе к мячу - ГИГАНТСКИЙ БОНУС
+                    if tm_dist < ctrl_dist * 0.5:
+                        score += 0.8  # Теперь это действие станет главным!
+                        metadata["emergency_switch"] = 0.8
+                        break
+
+        risk = 0.1
+        ev = score - risk
+        return score, risk, ev, metadata
+
+    @staticmethod
+    def _score_shield(state: MatchState) -> tuple[float, float, float, dict[str, float]]:
+        score = 0.0
+        metadata: dict[str, float] = {}
+
+        if state.nearest_opponent_dist < 60:
+            score += 0.4
+            metadata["contact_range"] = 0.4
+        if state.possession == PossessionState.OWN_TEAM:
+            score += 0.1
+            metadata["protect_ball"] = 0.1
+
+        risk = 0.05
+        ev = score - risk
+        return score, risk, ev, metadata
+
+    def _score_gk_rush(self, state: MatchState) -> tuple[float, float, float, dict[str, float]]:
+        score = 0.0
+        metadata = {}
+        # Если мяч у соперника и он входит в зону вратаря
+        if state.possession == PossessionState.OPPONENT and state.nearest_opponent_dist_to_gk < 400:
+            score += 0.6 * self._w_def_shape
+            metadata["gk_rush_opportunity"] = 0.6
+        return score, 0.2, score - 0.2, metadata
+
+    def reset_cooldowns(self) -> None:
+        """Очищает словарь с кулдаунами всех действий."""
+        self._cooldown_timers = {}  # Или как там у тебя называется словарь с таймерами
+
+--- FILE: decision/safety.py ---
+"""Rule-based safety layer.
+
+Filters and overrides action candidates to prevent dangerous decisions.
+Runs BEFORE the final action selection.
+"""
+
+from __future__ import annotations
+
+from config.settings import Config
+from decision.actions import ActionSpec, ActionType
+from state.match_state import MatchState, PossessionState, Zone
+
+
+class SafetyLayer:
+    """Applies hard safety rules to the candidate action list.
+
+    Rules:
+    1. Block actions exceeding the max risk threshold.
+    2. Force clear/contain in emergency defensive situations.
+    3. Prevent shooting from own half.
+    4. Prevent through balls under heavy pressure.
+    5. Force super-cancel on detected stumble/collision.
+    """
+
+    def __init__(self, cfg: Config) -> None:
+        # Пытаемся найти в секции decision, иначе берем из корня
+        d_cfg = getattr(cfg, 'decision', cfg)
+        self._max_risk: float = getattr(d_cfg, 'max_risk_threshold', 0.8)
+
+    def filter(
+            self, candidates: list[ActionSpec], state: MatchState
+    ) -> list[ActionSpec]:
+        """Return filtered and potentially reordered candidate list."""
+        filtered: list[ActionSpec] = []
+
+        for spec in candidates:
+            # Rule 1: block excessive risk
+            if spec.risk > self._max_risk:
+                continue
+
+            # Rule 3: no shooting from own half
+            if spec.action_type in (
+                    ActionType.SHOOT, ActionType.LOW_DRIVEN_SHOT,
+                    ActionType.FINESSE_SHOT, ActionType.TRIVELA_SHOT,
+            ) and state.controlled_zone != Zone.ATTACKING_THIRD:  # Изменили == на !=
+                continue
+
+            # Rule 4: no through balls under heavy pressure
+            if spec.action_type == ActionType.THROUGH_BALL and state.local_pressure > 0.7:
+                continue
+
+            if spec.action_type == ActionType.GK_RUSH:
+                # 1. Если мяч уже слишком близко к воротам (расстояние < 150)
+                # 2. Или вратарь убежал слишком далеко от своих ворот (например, > 600)
+                if state.distance_to_ball < 150 or state.nearest_opponent_dist_to_gk < 100:
+                    continue  # Блокируем выход вратаря
+
+            filtered.append(spec)
+
+        # Rule 2: force defensive action in emergency
+        if state.defensive_danger > 0.8 and state.possession != PossessionState.OWN_TEAM:
+            defensive_actions = {
+                ActionType.CLEAR, ActionType.CONTAIN, ActionType.JOCKEY,
+                ActionType.SPEED_JOCKEY, ActionType.STAND_TACKLE,
+            }
+            defensive = [s for s in filtered if s.action_type in defensive_actions]
+            if defensive:
+                # Move defensive actions to the top
+                others = [s for s in filtered if s.action_type not in defensive_actions]
+                filtered = defensive + others
+
+        # Rule 5: force super-cancel on stumble detection
+        if _detect_stumble(state):
+            super_cancel = [s for s in filtered if s.action_type == ActionType.SUPER_CANCEL]
+            if super_cancel:
+                return super_cancel
+
+
+
+        if not filtered:
+            # Always allow at least MOVE or CANCEL
+            filtered = [ActionSpec(
+                action_type=ActionType.CANCEL,
+                score=0.01,
+                risk=0.0,
+                expected_value=0.0,
+            )]
+
+        return filtered
+
+
+def _detect_stumble(state: MatchState) -> bool:
+    """Heuristic stumble detection: sudden velocity drop after contact.
+
+    Compares current frame velocity to the previous frame's velocity.
+    A large drop while an opponent is nearby suggests a collision/stumble.
+    """
+    if state.controlled_player is None or state.previous is None:
+        return False
+    prev = state.previous
+    if prev.controlled_player is None:
+        return False
+
+    cur_speed = state.controlled_player.speed
+    prev_speed = prev.controlled_player.speed
+
+    # Sudden speed drop > 60% while opponent is close
+    if prev_speed > 3.0 and cur_speed < prev_speed * 0.4:
+        if state.nearest_opponent_dist < 80:
+            return True
+    return False
+
+--- FILE: main.py ---
+"""Football AI Research Framework — Main entry point.
+
+Orchestrates: Capture → Detect → Track → Estimate → Tactize → Decide → Execute → Observe
+Controls: F1 = activate bot, F2 = pause bot, Q in overlay window = quit
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import signal
+import sys
+import time
+
+
+import numpy as np
+
+try:
+    import keyboard
+except ImportError:
+    keyboard = None  # type: ignore[assignment]
+
+try:
+    import cv2
+    _CV2 = True
+except ImportError:
+    cv2 = None
+    _CV2 = False
+
+from config.settings import Config, load_config
+from control.fc26_mechanics import FC26Mechanics
+from control.gamepad import GamepadInterface
+from control.controller import ActionController
+from decision.engine import DecisionEngine
+from observe.logger import EventLogger
+from observe.metrics import PerformanceMetrics
+from observe.overlay import DebugOverlay
+from observe.replay import ReplayRecorder
+from observe.telemetry import TelemetryPipeline
+from state.estimator import StateEstimator
+from tactics.modes import TacticalFSM
+from vision.tracker import ObjectTracker
+from vision.types import TrackedObject
+
+logger = logging.getLogger("football_ai")
+
+
+class Pipeline:
+    def __init__(self, cfg: Config) -> None:
+        self._cfg = cfg
+        self._running = False
+        self._frame_id = 0
+        self.bot_active = False
+
+        self._tracker = ObjectTracker(cfg)
+        self._estimator = StateEstimator(cfg)
+        self._tactics = TacticalFSM(cfg)
+        self._engine = DecisionEngine(cfg)
+        self._fc26 = FC26Mechanics(cfg)
+
+        self._gamepad = GamepadInterface()
+        self._controller = ActionController(cfg, self._gamepad)
+
+        self._metrics = PerformanceMetrics(window_size=60)
+        self._event_logger = EventLogger(cfg)
+        self._overlay = DebugOverlay(cfg)
+        self._replay = ReplayRecorder(cfg, session_id=str(int(time.time())))
+        self._telemetry = TelemetryPipeline(cfg, self._event_logger, self._metrics)
+
+    def run_live(self) -> None:
+        from capture.screen import ScreenCapture
+        from vision.detector import YOLODetector
+
+        capture = ScreenCapture(self._cfg)
+        detector = YOLODetector(self._cfg)
+        class_map = self._build_class_map()
+
+        self._running = True
+        self.bot_active = False
+
+        logger.info(">>> SYSTEM INITIALIZED")
+        for i in range(5, 0, -1):
+            logger.info(f">>> Starting in {i}s... (switch to game window)")
+            time.sleep(1)
+
+        logger.info(">>> SYSTEM RUNNING — F1=START, F2=PAUSE")
+
+        obs_cfg = getattr(self._cfg, 'observe', None)
+        overlay_on = getattr(obs_cfg, 'overlay_enabled', False) if obs_cfg else False
+
+        if overlay_on and _CV2 and cv2 is not None:
+            cv2.namedWindow("Football AI Debug", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("Football AI Debug", 960, 540)
+
+        try:
+            while self._running:
+                # --- Hotkeys ---
+                if keyboard is not None:
+                    if keyboard.is_pressed("f1") and not self.bot_active:
+                        self.bot_active = True
+                        logger.info(">>> BOT ACTIVATED")
+                        time.sleep(0.3)
+                    if keyboard.is_pressed("f2") and self.bot_active:
+                        self.bot_active = False
+                        self._controller.cancel()
+                        logger.info(">>> BOT PAUSED")
+                        time.sleep(0.3)
+                    if keyboard.is_pressed("caps lock"):
+                        # Имитируем нажатие кнопки 'A' на Xbox (обычно это кнопка 0 или 1)
+                        # Мы вызываем метод напрямую через интерфейс геймпада
+                        self._gamepad.press_button("A")
+                        self._gamepad.update()
+                        logger.info(">>> CAPSLOCK: Sending Xbox 'A' button")
+                        time.sleep(0.1)
+                        self._gamepad.release_button("A")
+                        self._gamepad.update()
+                        time.sleep(0.4)  # Чтобы не было двойного нажатия
+
+                self._metrics.total.start()
+                self._metrics.tick_frame()
+                self._frame_id += 1
+
+                # --- Capture ---
+                frame = capture.grab()
+                if frame is None:
+                    break
+
+                # --- Detect ---
+                detections = detector.detect(frame, self._frame_id)
+                for det in detections:
+                    self._metrics.record_detection_confidence(det.confidence)
+
+                # --- Track ---
+                tracked = self._tracker.update(detections, class_map)
+
+                # --- Periodic console log ---
+                if self._frame_id % 30 == 0:
+                    logger.info(
+                        f"Frame {self._frame_id} | Objects: {len(detections)} | "
+                        f"FPS: {self._metrics.fps:.1f} | Active: {self.bot_active}"
+                    )
+
+                # --- Process (estimate → decide → execute) ---
+                self._process_frame(tracked, frame, execute_gamepad=self.bot_active)
+
+                obs_cfg = getattr(self._cfg, 'observe', None)
+                overlay_on = getattr(obs_cfg, 'overlay_enabled', False) if obs_cfg else False
+
+                # --- Show overlay ---
+                if overlay_on and _CV2 and cv2 is not None:
+                    cv2.imshow("Football AI Debug", frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+
+                self._metrics.total.stop()
+
+        except KeyboardInterrupt:
+            logger.info("Interrupted by user.")
+        finally:
+            if _CV2 and cv2 is not None:
+                cv2.destroyAllWindows()
+            self._shutdown(capture)
+
+    def _process_frame(
+            self,
+            tracked: list[TrackedObject],
+            frame: np.ndarray | None = None,
+            execute_gamepad: bool = True,
+    ) -> None:
+        """Core per-frame: estimate → tactize → decide → execute."""
+        # --- State estimation ---
+        # Теперь мы реально используем current_fps
+        current_fps = self._metrics.fps if self._metrics.fps > 0 else 30.0
+
+        # Передаем fps в estimate (проверь, чтобы в estimator.py аргумент был добавлен)
+        state = self._estimator.estimate(tracked, self._frame_id, fps=current_fps)
+
+        # --- Tactical FSM ---
+        tactical = self._tactics.update(state)
+
+        # --- Decision ---
+        result = self._engine.decide(state)
+        chosen = result.chosen
+
+        # --- Execute ---
+        if execute_gamepad:
+            # FIX: Always send the latest decision to the controller.
+            # The controller handles smooth transitions internally —
+            # do NOT gate on is_busy, or movement has dead frames.
+            self._controller.execute(chosen)
+            self._controller.tick()
+        else:
+            # Bot paused — just tick to drain any remaining queued inputs
+            self._controller.tick()
+
+        # --- Telemetry ---
+        self._telemetry.record_decision(chosen.action_type.value)
+        self._telemetry.record_mode(tactical.mode.value)
+        self._telemetry.tick(self._frame_id)
+
+        # --- Overlay ---
+        if frame is not None:
+            self._overlay.render(frame, state, tactical, chosen, self._metrics, tracked)
+
+    def _build_class_map(self) -> dict[int, str]:
+        vis_cfg = getattr(self._cfg, 'vision', None)
+        raw = getattr(vis_cfg, 'class_map', {}) if vis_cfg else {}
+        if isinstance(raw, dict):
+            return {int(k): str(v) for k, v in raw.items()}
+        if hasattr(raw, "to_dict"):
+            return {int(k): str(v) for k, v in raw.to_dict().items()}
+        # Fallback: scan attributes
+        result: dict[int, str] = {}
+        for i in range(10):
+            if hasattr(raw, str(i)):
+                result[i] = getattr(raw, str(i))
+        return result
+
+    def _shutdown(self, capture=None) -> None:
+        self._running = False
+        self._controller.cancel()
+        self._telemetry.final_flush(self._frame_id)
+        self._event_logger.close()
+        self._replay.close()
+        if capture is not None:
+            capture.release()
+        logger.info(f"Pipeline stopped after {self._frame_id} frames.")
+        logger.info(f"Performance: {self._metrics.summary()}")
+
+    @staticmethod
+    def run_replay(video_path: str) -> None:
+        """
+        Метод для запуска анализа записанного видео вместо живой игры.
+        Пока что это просто заглушка, чтобы не было ошибки.
+        """
+        logger.info(f">>> REPLAY MODE STARTED for: {video_path}")
+        # Здесь в будущем будет код, который читает видеофайл кадр за кадром
+        pass
+
+    def stop(self) -> None:
+        self._running = False
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Football AI Research Framework — Offline Sandbox"
+    )
+    parser.add_argument("--mode", choices=["live", "replay", "eval"], default="live")
+    parser.add_argument("--config", type=str, default=None)
+    parser.add_argument("--video", type=str, default=None)
+    parser.add_argument("--log-level", type=str, default="INFO")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    )
+
+    cfg = load_config(path=args.config)
+
+    if args.mode == "eval":
+        from evaluate.harness import EvaluationHarness
+
+        harness = EvaluationHarness(cfg)
+        report = harness.run_all()
+        print(report.summary())
+        sys.exit(0 if report.failed == 0 else 1)
+    elif args.mode == "replay":
+        if not args.video:
+            parser.error("--video required for replay mode")
+        pipeline = Pipeline(cfg)
+        signal.signal(signal.SIGINT, lambda *_: pipeline.stop())
+        pipeline.run_replay(args.video)
+    else:
+        pipeline = Pipeline(cfg)
+        signal.signal(signal.SIGINT, lambda *_: pipeline.stop())
+        pipeline.run_live()
+
+
+if __name__ == "__main__":
+    main()

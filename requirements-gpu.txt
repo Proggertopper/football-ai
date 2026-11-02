@@ -1,0 +1,7 @@
+S# Optional stack for high FPS on Windows + NVIDIA (e.g. RTX 3060)
+# pip install -r requirements-gpu.txt
+
+ultralytics>=8.0.0
+torch  # install from pytorch.org with CUDA wheel matching your driver
+dxcam>=0.0.5; sys_platform == "win32"
+# TensorRT: install the wheel matching your CUDA version from NVIDIA, or use the one bundled with your setup

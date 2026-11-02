@@ -1,0 +1,253 @@
+# ============================================================
+# Football AI Research Framework — Master Configuration
+# All tunable parameters live here. No magic numbers in code.
+# ============================================================
+
+# --- Screen capture ---
+capture:
+  backend: "dxcam"                 # Включаем супер-быстрый захват             # "mss" (default) or "dxcam" (Windows DXGI — faster for many games)
+  monitor_index: 1            # mss monitor index (1 = primary); also used to position dxcam crop
+  width: 1280
+  height: 720
+  fps_target: 60
+  region: null                # null = full screen; or {x, y, w, h}
+  # DXCam only (pip install dxcam): output 0 = first monitor on GPU; see DXCam docs if multi-monitor
+  dxcam_output_idx: 0
+  dxcam_target_fps: 60       # async capture thread; 0 = synchronous grab() only
+
+# --- Vision / detection ---
+vision:
+  # Use .engine after: python scripts/export_yolo_tensorrt.py --weights models/best.pt --imgsz 320
+  model_path: "models/best.engine"
+  confidence_threshold: 0.15
+  iou_threshold: 0.45
+  device: "cuda"              # "cuda", "cpu", or "mps"
+  input_size: 320              # must match export + predict imgsz (320 for throughput)
+  cudnn_benchmark: true       # faster fixed-size convs on CUDA (tiny startup cost)
+  diagnostics_zero_detection_warn_streak: 30
+  # If your model labels every outfield player as class 6 (or one id), include it here
+  # so jersey color can split into player_team (0) vs player_opponent (6).
+  # [0, 6]: run color filter on both raw ids so all field players get a team label.
+  team_color_split_field_player_ids: [0, 6]
+  team_color_split_goalkeeper_ids: [1]
+  debug_print_detections: false   # true: log raw class_ids per frame (noisy)
+  half_precision: true            # FP16 on GPU only; ignored on CPU
+  # Class name mapping from your YOLO model
+  class_map:
+    0: "player_team"
+    1: "goalkeeper_team"
+    2: "ball"
+    3: "referee"
+    4: "side Referee"
+    5: "staff Member"
+    6: "player_opponent"     # Добавили
+    7: "goalkeeper_opponent" # Добавили
+
+# --- Object tracker ---
+tracker:
+  max_age: 8                  # frames before dropping a track
+  min_hits: 1                 # 1 = feed pipeline immediately (use 2–3 if tracks flicker)
+  iou_match_threshold: 0.3
+  velocity_smoothing_alpha: 0.4   # EMA alpha for velocity estimation
+  position_smoothing_alpha: 0.5   # EMA alpha for position smoothing
+  max_displacement_per_frame: 150  # pixels — reject jumps larger than this
+
+# --- World model (screen → normalized coords) ---
+world:
+  field_width: 1.0            # normalized [0..1]
+  field_height: 1.0
+  screen_width: 1280
+  screen_height: 720
+  # Margins to crop HUD elements (pixels)
+  crop_top: 100
+  crop_bottom: 40
+  crop_left: 0
+  crop_right: 0
+  # Flip RS / lateral stick X when camera attacks the other goal (side switching)
+  attack_direction_sign: 1.0   # -1.0 to mirror X
+
+# --- State estimation ---
+state:
+  history_length: 15          # frames of state history to keep
+  prediction_horizon_sec: 0.5 # seconds to predict ahead
+  possession_distance_threshold: 60  # pixels — ball within this = possession
+  pressure_radius: 150        # pixels — opponents within this radius = pressure
+  passing_lane_width: 30      # pixels — corridor width for lane checks
+  shot_lane_width: 25
+  open_space_radius: 80       # no opponents within this = open space
+  zone_boundaries:            # normalized x thresholds
+    defensive_third: 0.33
+    middle_third: 0.66
+  # Normalized field x (0=left, 1=right); above = deep in opponent half / box area
+  opponent_box_normalized_x_min: 0.78
+  # Do not create passing lanes to teammates with an opponent this close (pixels)
+  pass_receiver_min_opponent_distance: 72
+  # Stand/slide tackle only when this close to the opponent nearest the ball ( / field diagonal )
+  tackle_carrier_distance_normalized_max: 0.06
+  # Linear ball extrapolation when detector drops the ball briefly
+  ball_ghost_max_frames: 10
+  # Estimator forces is_paused/wait_for_input off each frame; values below are inert / documentation
+  ball_absent_pause_frames: 999999
+  ball_resume_confidence: 0.0
+  ball_resume_streak_frames: 1
+  set_piece_max_ball_speed: -1.0
+  set_piece_center_radius_px: 0
+  pass_boundary_margin: 0.5
+
+# --- Decision engine ---
+decision:
+  # Weights for action scoring components
+  weights:
+    goal_threat: 0.3
+    safety: 0.5
+    support: 1.2
+    turnover_risk: -1.0
+    opponent_proximity: -0.6
+    angle_to_goal: 0.2
+    defensive_shape: 0.7
+  # Hysteresis — minimum score delta to switch actions
+  hysteresis_threshold: 0.01
+  # Minimum frames before allowing action switch
+  min_action_hold_frames: 1
+  # Risk threshold — block actions above this risk score
+  max_risk_threshold: 0.95
+
+
+# --- Action definitions ---
+actions:
+  # After A/Y pass, block shoot variants unless in opponent box (see MatchState.in_opponent_penalty_area)
+  post_pass_shoot_suppress_frames: 18
+  cooldowns:  # frames
+    pass: 4
+    through_ball: 12
+    shoot: 15
+    # Shared by stand_tackle + sliding_tackle (anti-spam)
+    tackle: 30
+    stand_tackle: 30
+    sliding_tackle: 30
+    sprint: 0
+    jockey: 0
+    move: 0
+    clear: 10
+    contain: 5
+    switch_player: 2
+    cancel: 0
+  durations:  # frames (approximate hold time)
+    pass: 2         # tap A — long holds often register as follow-up shot input
+    through_ball: 5
+    shoot: 2
+    stand_tackle: 8
+    sprint: 1       # continuous
+    jockey: 1       # continuous
+    clear: 5
+    contain: 1      # continuous
+    switch_player: 2
+    rs_switch: 8    # RS flick + return neutral (controller splits into phases)
+    sliding_tackle: 10
+    dribble_to_goal: 8
+    cancel: 2
+  # Full XInput deflection (0–1) after unit-vector RS switch direction
+  rs_switch_flick_magnitude: 1.0
+  # PASS / SHOOT / through require real ball at least this confident
+  offensive_min_ball_confidence: 0.3
+
+# --- FC 26 specific mechanics ---
+fc26:
+  precision_pass_enabled: true
+  low_driven_shot_enabled: true
+  r1_dribble_enabled: true
+  explosive_burst_enabled: true
+  l2_enforcer_shielding: true
+  enforcer_contact_radius: 50   # pixels
+  speed_jockey_enabled: true
+  stand_tackle_confidence_min: 0.85
+  rs_switch_flick_duration_ms: 30
+  rs_switch_min_improvement: 0.15  # minimum interception score improvement
+  trivela_angle_min: 30         # degrees from goal center
+  trivela_angle_max: 70
+  finesse_angle_min: 25
+  finesse_angle_max: 55
+  super_cancel_on_stumble: true
+  gk_manual_nudge_enabled: true
+
+# --- Tactical FSM ---
+tactics:
+  default_mode: "build_up"
+  transition_cooldown_frames: 10  # min frames between mode switches
+  team_colors:
+    home: [180, 110, 30]  # BGR sample of home (blue/azure) kit in capture
+  team_color_distance_threshold: 145   # higher = more forgiving (light/shadow on kit)
+  team_color_soft_factor: 1.12         # multiplies threshold (slight kit color drift)
+  modes:
+    build_up:
+      pass_preference: 0.5
+      dribble_preference: 0.5
+      risk_tolerance: 0.5
+    safe_progression:
+      pass_preference: 0.8
+      dribble_preference: 0.2
+      risk_tolerance: 0.2
+    final_third:
+      pass_preference: 0.4
+      dribble_preference: 0.3
+      shoot_preference: 0.3
+      risk_tolerance: 0.6
+    emergency_defense:
+      clear_preference: 0.5
+      contain_preference: 0.3
+      tackle_preference: 0.2
+      risk_tolerance: 0.1
+    press_containment:
+      contain_preference: 0.6
+      tackle_preference: 0.2
+      jockey_preference: 0.2
+      risk_tolerance: 0.3
+    box_defense:
+      clear_preference: 0.4
+      contain_preference: 0.3
+      tackle_preference: 0.3
+      risk_tolerance: 0.15
+    transition_recovery:
+      sprint_preference: 0.5
+      jockey_preference: 0.3
+      contain_preference: 0.2
+      risk_tolerance: 0.4
+    counterattack:
+      through_ball_preference: 0.4
+      sprint_preference: 0.3
+      pass_preference: 0.3
+      risk_tolerance: 0.7
+    set_piece:
+      risk_tolerance: 0.3
+
+# --- Observability ---
+observe:
+  overlay_enabled: false
+  decision_trace_verbose: false   # if true: INFO decision trace + reject/skip lines
+  pipeline_print_frames: false     # if true: periodic human-readable frame summary in main
+  overlay_alpha: 0.6
+  dump_zero_detection_frames: false
+  dump_zero_detection_every_n: 30
+  dump_zero_detection_dir: "logs/vision_debug"
+  dump_sparse_detection_threshold: 1
+  dump_sparse_detection_every_n: 15
+  log_file: "logs/events.jsonl"
+  log_level: "DEBUG"
+  replay_enabled: true
+  replay_dir: "replays"
+  replay_format: "json"          # "json" or "csv"
+  metrics_window_size: 60        # frames for rolling averages
+  telemetry_flush_interval: 30   # frames between telemetry writes
+
+# --- Live loop ---
+live:
+  capslock_send_a_debug: true   # true: CapsLock sends gamepad A (easy to trigger by accident)
+
+# --- Performance ---
+performance:
+  frame_skip: 2               # process every Nth frame (1 = no skip)
+  adaptive_skip: true          # auto-increase skip if FPS drops
+  adaptive_skip_fps_floor: 20
+  inference_thread: true       # run YOLO on separate thread
+  planning_budget_ms: 8        # max time for decision loop
+  profiling_enabled: false
