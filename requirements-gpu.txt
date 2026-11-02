@@ -1,4 +1,4 @@
-S# Optional stack for high FPS on Windows + NVIDIA (e.g. RTX 3060)
+# Optional stack for high FPS on Windows + NVIDIA (e.g. RTX 3060)
 # pip install -r requirements-gpu.txt
 
 ultralytics>=8.0.0
